@@ -1,0 +1,1168 @@
+#Requires -Version 5.1
+#Requires -Modules ActiveDirectory
+<#
+.SYNOPSIS
+  Active Directory Security & Delegation Assessment (strikt read-only).
+  Analysiert Gruppenmitgliedschaften (direkt, verschachtelt, PrimaryGroupID), OU-/Container-ACLs,
+  Delegierungen, privilegierte OUs, Risiko-Scoring; Export als CSV, JSON, HTML (optional PDF).
+
+.EXAMPLE
+  .\ADAssessment.ps1                                   # GUI
+  .\ADAssessment.ps1 -NoGui -Users max.mustermann,service_sql -Groups IT-Admins,Helpdesk -OutDir C:\Reports
+  .\ADAssessment.ps1 -NoGui -InputCsv .\input.csv -Server contoso.local -Pdf
+
+  CSV-Format:  Type,Identity   (Type = User | Group)
+#>
+[CmdletBinding()]
+param(
+    [switch]$NoGui,
+    [string[]]$Users = @(),
+    [string[]]$Groups = @(),
+    [string]$InputCsv,
+    [string]$Server,
+    [string[]]$CustomPrivilegedOUs = @(),
+    [switch]$IncludeContainers,
+    [int]$MaxDepth = 32,
+    [string]$OutDir,
+    [switch]$Pdf
+)
+
+$ErrorActionPreference = 'Stop'
+
+# WPF benoetigt STA
+if (-not $NoGui -and $PSCommandPath -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    & (Get-Process -Id $PID).Path -STA -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @PSBoundParameters
+    exit $LASTEXITCODE
+}
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+if (-not $OutDir) {
+    $base = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $OutDir = Join-Path $base 'reports'
+}
+
+# Gemeinsamer Zustand (Log, Fortschritt, Abbruch) - wird auch an den Analyse-Runspace uebergeben
+$Sync = [hashtable]::Synchronized(@{
+    Cancel = $false; Progress = 0; Status = ''; Result = $null; Error = $null; Done = $false
+    Console = [bool]$NoGui; LogFile = $null
+    Log = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]')
+})
+
+#region ===================== Analyse-Funktionen (laufen auch im Hintergrund-Runspace) =====================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $line = '{0:HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Message
+    if ($Sync) {
+        $Sync.Log.Enqueue($line)
+        if ($Sync.Console) { Write-Host $line }
+        if ($Sync.LogFile) { try { Add-Content -LiteralPath $Sync.LogFile -Value $line -Encoding UTF8 } catch { } }
+    }
+}
+
+function Set-Progress {
+    param([int]$Percent, [string]$Status, [switch]$NoLog)
+    if ($Sync) { $Sync.Progress = $Percent; $Sync.Status = $Status }
+    if (-not $NoLog) { Write-Log $Status }
+}
+
+function Get-SrvArgs {
+    if ($Cache -and $Cache.Server) { return @{ Server = $Cache.Server } }
+    return @{}
+}
+
+function ConvertTo-LdapEscaped {
+    param([string]$Text)
+    $Text -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29' -replace "`0", '\00'
+}
+
+function Get-GroupScopeName {
+    param($GroupType)
+    if ($null -eq $GroupType) { return $null }
+    $g = [int]$GroupType
+    if ($g -band 2) { 'Global' } elseif ($g -band 4) { 'DomainLocal' } elseif ($g -band 8) { 'Universal' } else { 'Unknown' }
+}
+
+function Get-PrivilegedGroupLabel {
+    param([string]$Sid)
+    $builtin = @{
+        'S-1-5-32-544' = 'Administrators'; 'S-1-5-32-548' = 'Account Operators'; 'S-1-5-32-549' = 'Server Operators'
+        'S-1-5-32-550' = 'Print Operators'; 'S-1-5-32-551' = 'Backup Operators'; 'S-1-5-32-552' = 'Replicators'
+    }
+    if ($builtin.ContainsKey($Sid)) { return $builtin[$Sid] }
+    $rids = @{
+        '512' = 'Domain Admins'; '518' = 'Schema Admins'; '519' = 'Enterprise Admins'; '520' = 'Group Policy Creator Owners'
+        '526' = 'Key Admins'; '527' = 'Enterprise Key Admins'
+    }
+    if ($Sid -match '^S-1-5-21-\d+-\d+-\d+-(\d+)$' -and $rids.ContainsKey($Matches[1])) { return $rids[$Matches[1]] }
+    return $null
+}
+
+function Test-Tier0Group {
+    param([string]$Label)
+    return ($Label -in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators')
+}
+
+function Convert-ToPrincipal {
+    param($Object)
+    [pscustomobject]@{
+        Dn             = [string]$Object.DistinguishedName
+        Name           = if ($Object.sAMAccountName) { [string]$Object.sAMAccountName } else { [string]$Object.Name }
+        Sid            = if ($Object.objectSid) { $Object.objectSid.Value } else { $null }
+        Class          = [string]$Object.objectClass
+        PrimaryGroupId = $Object.primaryGroupID
+        MemberOf       = @($Object.memberOf)
+        GroupType      = $Object.groupType
+    }
+}
+
+function Resolve-Principal {
+    param([string]$Identity, [ValidateSet('User', 'Group')][string]$Type)
+    $srv = Get-SrvArgs
+    $props = 'objectSid', 'sAMAccountName', 'objectClass', 'primaryGroupID', 'memberOf', 'groupType', 'adminCount'
+    $id = $Identity.Trim()
+    $o = $null
+    try {
+        if ($id -match '^S-1-\d+(-\d+)+$') {
+            $o = Get-ADObject -LDAPFilter "(objectSid=$id)" -Properties $props @srv | Select-Object -First 1
+        }
+        elseif ($id -match '^(CN|OU|DC)=') {
+            $o = Get-ADObject -Identity $id -Properties $props @srv
+        }
+        else {
+            if ($id -match '^[^\\]+\\(.+)$') { $id = $Matches[1] }
+            $esc = ConvertTo-LdapEscaped $id
+            $cls = if ($Type -eq 'Group') { '(objectClass=group)' } else { '(objectClass=user)' }
+            $attr = if ($id -match '@') { 'userPrincipalName' } else { 'sAMAccountName' }
+            $o = Get-ADObject -LDAPFilter "(&$cls($attr=$esc))" -Properties $props @srv | Select-Object -First 1
+        }
+    }
+    catch { Write-Log "Fehler beim Aufloesen von '$Identity': $($_.Exception.Message)" 'WARN' }
+    if (-not $o) { Write-Log "Objekt nicht gefunden: $Identity" 'WARN'; return $null }
+    return (Convert-ToPrincipal $o)
+}
+
+function Get-CachedGroup {
+    param([string]$Dn, [string]$Sid)
+    if ($Dn) {
+        $key = $Dn.ToLowerInvariant()
+        if ($Cache.Groups.ContainsKey($key)) { return $Cache.Groups[$key] }
+    }
+    elseif ($Sid -and $Cache.BySid.ContainsKey($Sid)) { return $Cache.BySid[$Sid] }
+    $srv = Get-SrvArgs
+    $props = 'objectSid', 'groupType', 'memberOf', 'sAMAccountName', 'adminCount'
+    $o = $null
+    try {
+        if ($Dn) { $o = Get-ADObject -Identity $Dn -Properties $props @srv }
+        else { $o = Get-ADObject -LDAPFilter "(objectSid=$Sid)" -Properties $props @srv | Select-Object -First 1 }
+    }
+    catch { Write-Log "Gruppe nicht lesbar: $Dn$Sid ($($_.Exception.Message))" 'WARN' }
+    if (-not $o) { return $null }
+    $p = Convert-ToPrincipal $o
+    $Cache.Groups[$p.Dn.ToLowerInvariant()] = $p
+    if ($p.Sid) { $Cache.BySid[$p.Sid] = $p }
+    return $p
+}
+
+function New-MembershipRow {
+    param($Principal, $Group, [int]$Depth, [string]$Relation, [string]$Path, [bool]$IsCycle = $false)
+    $label = Get-PrivilegedGroupLabel $Group.Sid
+    $risk = if ($IsCycle) { 'MEDIUM' }
+            elseif ($label) { if (Test-Tier0Group $label) { 'CRITICAL' } else { 'HIGH' } }
+            else { 'LOW' }
+    [pscustomobject]@{
+        Principal       = $Principal.Name
+        PrincipalType   = $Principal.Class
+        Group           = $Group.Name
+        Scope           = Get-GroupScopeName $Group.GroupType
+        Category        = if ($null -ne $Group.GroupType -and [int]$Group.GroupType -lt 0) { 'Security' } else { 'Distribution' }
+        Relation        = $Relation
+        Depth           = $Depth
+        PrivilegedGroup = $label
+        Risk            = $risk
+        Path            = $Path
+        GroupSid        = $Group.Sid
+        GroupDn         = $Group.Dn
+        Cycle           = $IsCycle
+    }
+}
+
+function Get-MembershipTree {
+    # Breitensuche nach oben (memberOf) + PrimaryGroup. Zyklen werden erkannt, Endlosschleifen verhindert.
+    param($Principal, [int]$MaxDepth = 32)
+    $rows = New-Object System.Collections.Generic.List[object]
+    $visited = @{}
+    $visited[$Principal.Dn.ToLowerInvariant()] = $true
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    $queue.Enqueue([pscustomobject]@{ Node = $Principal; Names = @($Principal.Name); Dns = @($Principal.Dn.ToLowerInvariant()); Depth = 0 })
+
+    while ($queue.Count -gt 0) {
+        if ($Sync -and $Sync.Cancel) { break }
+        $cur = $queue.Dequeue()
+        $edges = New-Object System.Collections.Generic.List[object]
+        foreach ($dn in $cur.Node.MemberOf) {
+            $g = Get-CachedGroup -Dn $dn
+            if ($g) { $edges.Add([pscustomobject]@{ Group = $g; Relation = $null }) }
+        }
+        if ($cur.Depth -eq 0 -and $Principal.PrimaryGroupId -and $Principal.Sid -match '^(S-1-5-21-\d+-\d+-\d+)-\d+$') {
+            $pg = Get-CachedGroup -Sid ('{0}-{1}' -f $Matches[1], $Principal.PrimaryGroupId)
+            if ($pg) { $edges.Add([pscustomobject]@{ Group = $pg; Relation = 'Primary' }) }
+        }
+        foreach ($e in $edges) {
+            $g = $e.Group
+            $depth = $cur.Depth + 1
+            $gk = $g.Dn.ToLowerInvariant()
+            if ($cur.Dns -contains $gk) {
+                $path = (($cur.Names + $g.Name) -join ' -> ')
+                $rows.Add((New-MembershipRow -Principal $Principal -Group $g -Depth $depth -Relation 'Cycle' -Path $path -IsCycle $true))
+                Write-Log "Zyklus in verschachtelten Gruppen erkannt: $path" 'WARN'
+                continue
+            }
+            if ($visited.ContainsKey($gk)) { continue }
+            $visited[$gk] = $true
+            $rel = if ($e.Relation) { $e.Relation } elseif ($depth -eq 1) { 'Direct' } else { 'Nested' }
+            $names = $cur.Names + $g.Name
+            $rows.Add((New-MembershipRow -Principal $Principal -Group $g -Depth $depth -Relation $rel -Path ($names -join ' -> ')))
+            if ($depth -lt $MaxDepth) {
+                $queue.Enqueue([pscustomobject]@{ Node = $g; Names = $names; Dns = ($cur.Dns + $gk); Depth = $depth })
+            }
+        }
+    }
+    return $rows
+}
+
+function Get-EffectiveSids {
+    # "Token": eigene SID + alle (verschachtelten) Gruppen + Primary Group + Everyone/Authenticated Users
+    param($Principal, $Rows)
+    $t = @{}
+    $t[$Principal.Sid] = [pscustomobject]@{ Sid = $Principal.Sid; Name = $Principal.Name; Level = 0; Source = 'Direct'; Path = $Principal.Name }
+    foreach ($r in $Rows) {
+        if ($r.Cycle) { continue }
+        if (-not $t.ContainsKey($r.GroupSid)) {
+            $t[$r.GroupSid] = [pscustomobject]@{
+                Sid = $r.GroupSid; Name = $r.Group; Level = $r.Depth
+                Source = $(if ($r.Depth -eq 1) { 'Group' } else { 'Nested Group' }); Path = $r.Path
+            }
+        }
+    }
+    foreach ($wk in @(@('S-1-1-0', 'Everyone'), @('S-1-5-11', 'Authenticated Users'))) {
+        if (-not $t.ContainsKey($wk[0])) {
+            $t[$wk[0]] = [pscustomobject]@{ Sid = $wk[0]; Name = $wk[1]; Level = 0; Source = 'WellKnown'; Path = ('{0} -> {1}' -f $Principal.Name, $wk[1]) }
+        }
+    }
+    return $t
+}
+
+function Get-GuidMap {
+    # ObjectType-/InheritedObjectType-GUIDs aus Schema und Extended Rights aufloesen
+    $srv = Get-SrvArgs
+    $map = @{}
+    $root = Get-ADRootDSE @srv
+    Get-ADObject -SearchBase $root.schemaNamingContext -LDAPFilter '(schemaIDGUID=*)' -Properties lDAPDisplayName, schemaIDGUID @srv |
+        ForEach-Object { $map[(New-Object Guid (, [byte[]]$_.schemaIDGUID)).ToString()] = [string]$_.lDAPDisplayName }
+    Get-ADObject -SearchBase ('CN=Extended-Rights,' + $root.configurationNamingContext) -LDAPFilter '(objectClass=controlAccessRight)' -Properties rightsGuid, displayName @srv |
+        ForEach-Object { if ($_.rightsGuid) { $map[([string]$_.rightsGuid).ToLowerInvariant()] = [string]$_.displayName } }
+    return $map
+}
+
+function Resolve-GuidName {
+    param([guid]$Guid, $Map)
+    $k = $Guid.ToString()
+    if ($Map.ContainsKey($k)) { return $Map[$k] }
+    return $k
+}
+
+function Get-AceInfo {
+    param($Rule, $GuidMap)
+    $rights = [int]$Rule.ActiveDirectoryRights
+    $ot = [guid]$Rule.ObjectType
+    $otName = if ($ot -ne [guid]::Empty) { Resolve-GuidName $ot $GuidMap } else { $null }
+    $ioName = if ([guid]$Rule.InheritedObjectType -ne [guid]::Empty) { Resolve-GuidName ([guid]$Rule.InheritedObjectType) $GuidMap } else { $null }
+
+    $sensitive = @{
+        'member' = 55; 'gPLink' = 60; 'gPOptions' = 50; 'userAccountControl' = 50; 'servicePrincipalName' = 50
+        'msDS-AllowedToActOnBehalfOfOtherIdentity' = 60; 'msDS-KeyCredentialLink' = 60; 'unicodePwd' = 60
+        'ms-Mcs-AdmPwd' = 60; 'msLAPS-Password' = 60; 'msLAPS-EncryptedPassword' = 60; 'scriptPath' = 40
+        'altSecurityIdentities' = 50; 'msDS-AllowedToDelegateTo' = 60; 'nTSecurityDescriptor' = 90
+    }
+    $classScore = @{ 'user' = 45; 'group' = 40; 'computer' = 35; 'organizationalUnit' = 35; 'groupPolicyContainer' = 40; 'inetOrgPerson' = 45 }
+    $extScore = @{
+        '00299570-246d-11d0-a768-00aa006e0529' = 60   # Reset Password
+        'ab721a53-1e2f-11d0-9819-00aa0040529b' = 20   # Change Password
+        '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 50   # DS-Replication-Get-Changes
+        '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 80   # DS-Replication-Get-Changes-All (DCSync)
+        '89e95b76-444d-4c62-991a-0facbeda640c' = 50   # Get-Changes-In-Filtered-Set
+    }
+
+    $c = New-Object System.Collections.Generic.List[object]
+    $add = { param($n, $s) $c.Add([pscustomobject]@{ Name = $n; Score = $s }) }
+
+    if (($rights -band 0xF01FF) -eq 0xF01FF) { & $add 'GenericAll' 100 }
+    if ($rights -band 0x40000) { & $add 'WriteDACL' 90 }
+    if ($rights -band 0x80000) { & $add 'WriteOwner' 90 }
+    if (($rights -band 0x20028) -eq 0x20028) { & $add 'GenericWrite' 70 }
+    if ($rights -band 0x10000) { & $add 'Delete' 35 }
+    if ($rights -band 0x40) { & $add 'DeleteTree' 55 }
+    if ($rights -band 0x20) {
+        if (-not $otName) { & $add 'WriteProperty (alle Attribute)' 65 }
+        else { $s = 30; if ($sensitive.ContainsKey($otName)) { $s = [Math]::Max(30, $sensitive[$otName]) }; & $add "WriteProperty ($otName)" $s }
+    }
+    if ($rights -band 0x100) {
+        if (-not $otName) { & $add 'AllExtendedRights' 65 }
+        else { $s = 30; $k = $ot.ToString(); if ($extScore.ContainsKey($k)) { $s = $extScore[$k] }; & $add "ExtendedRight ($otName)" $s }
+    }
+    if ($rights -band 0x1) {
+        if (-not $otName) { & $add 'CreateChild (alle Klassen)' 35 }
+        else { $s = 30; if ($classScore.ContainsKey($otName)) { $s = $classScore[$otName] }; & $add "CreateChild ($otName)" $s }
+    }
+    if ($rights -band 0x2) {
+        if (-not $otName) { & $add 'DeleteChild (alle Klassen)' 35 } else { & $add "DeleteChild ($otName)" 30 }
+    }
+    if ($rights -band 0x8) {
+        if (-not $otName) { & $add 'Self' 20 } else { & $add "Self ($otName)" 25 }
+    }
+    if ($rights -band 0x10) {
+        if (-not $otName) { & $add 'ReadProperty' 5 }
+        else { $s = 5; if ($sensitive.ContainsKey($otName)) { $s = $sensitive[$otName] }; & $add "ReadProperty ($otName)" $s }
+    }
+    if ($rights -band 0x20000) { & $add 'ReadControl' 5 }
+    if ($rights -band 0x84) { & $add 'List' 5 }
+
+    $best = $c | Sort-Object Score -Descending | Select-Object -First 1
+    if (-not $best) { $best = [pscustomobject]@{ Name = [string]$Rule.ActiveDirectoryRights; Score = 5 } }
+    [pscustomobject]@{
+        Permission = $best.Name; Score = [int]$best.Score; Rights = [string]$Rule.ActiveDirectoryRights
+        ObjectTypeName = $otName; InheritedObjectTypeName = $ioName
+    }
+}
+
+function Get-RiskRating {
+    # Kategorie haengt von Recht, Zielobjekt (Tier) und Reichweite ab. Verschachtelung beeinflusst NUR den
+    # angezeigten Score (max. +6), nie die Risikokategorie.
+    param([int]$Base, [string]$Tier, [int]$Level, [string]$AppliesTo)
+    $score = $Base
+    if ($Base -ge 30) {
+        if ($Tier -eq 'Tier0') { $score += 10 } elseif ($Tier -eq 'Privileged') { $score += 5 }
+        if ($AppliesTo -match 'alle untergeordneten') { $score += 3 }
+    }
+    $score = [Math]::Min($score, 100)
+    $rating = if ($score -ge 90) { 'CRITICAL' } elseif ($score -ge 60) { 'HIGH' } elseif ($score -ge 30) { 'MEDIUM' } else { 'LOW' }
+    if ($rating -eq 'CRITICAL' -and $Tier -eq 'Tier0') { $rating = 'CRITICAL (Tier-0)' }
+    $display = $score
+    if ($Base -ge 30) { $display = [Math]::Min($score + [Math]::Min($Level * 2, 6), 100) }
+    [pscustomobject]@{ Score = $display; Rating = $rating }
+}
+
+function Get-AssessmentTargets {
+    param([string]$DomainDn, [bool]$IncludeContainers)
+    $srv = Get-SrvArgs
+    $list = New-Object System.Collections.Generic.List[object]
+    $root = Get-ADObject -Identity $DomainDn -Properties nTSecurityDescriptor @srv
+    $list.Add([pscustomobject]@{ Dn = [string]$root.DistinguishedName; Type = 'Domain'; Acl = $root.nTSecurityDescriptor })
+    foreach ($ou in (Get-ADOrganizationalUnit -Filter * -SearchBase $DomainDn -SearchScope Subtree -Properties nTSecurityDescriptor @srv)) {
+        $list.Add([pscustomobject]@{ Dn = [string]$ou.DistinguishedName; Type = 'OU'; Acl = $ou.nTSecurityDescriptor })
+    }
+    try {
+        $a = Get-ADObject -Identity ("CN=AdminSDHolder,CN=System,$DomainDn") -Properties nTSecurityDescriptor @srv
+        $list.Add([pscustomobject]@{ Dn = [string]$a.DistinguishedName; Type = 'AdminSDHolder'; Acl = $a.nTSecurityDescriptor })
+    }
+    catch { Write-Log "AdminSDHolder nicht lesbar: $($_.Exception.Message)" 'WARN' }
+    if ($IncludeContainers) {
+        foreach ($ct in (Get-ADObject -SearchBase $DomainDn -SearchScope OneLevel -LDAPFilter '(objectClass=container)' -Properties nTSecurityDescriptor @srv)) {
+            $list.Add([pscustomobject]@{ Dn = [string]$ct.DistinguishedName; Type = 'Container'; Acl = $ct.nTSecurityDescriptor })
+        }
+    }
+    return $list
+}
+
+function Get-PrivilegedTargetMap {
+    # Liefert DN(lowercase) -> @{ Tier = Tier0|Privileged; Reason = ... }
+    param([string]$DomainDn, $Targets, [string[]]$Custom)
+    $srv = Get-SrvArgs
+    $map = @{}
+    $seeds = New-Object System.Collections.Generic.List[object]   # fuer Vererbung auf untergeordnete OUs
+    $set = {
+        param($dn, $tier, $reason, $propagate)
+        $k = $dn.ToLowerInvariant()
+        if (-not $map.ContainsKey($k) -or ($tier -eq 'Tier0' -and $map[$k].Tier -ne 'Tier0')) {
+            $map[$k] = @{ Tier = $tier; Reason = $reason }
+        }
+        if ($propagate) { $seeds.Add(@{ Key = $k; Tier = $tier }) }
+    }
+    & $set $DomainDn 'Tier0' 'Domaenen-Root' $false
+    & $set ("OU=Domain Controllers,$DomainDn") 'Tier0' 'Domain Controllers OU' $true
+    & $set ("CN=AdminSDHolder,CN=System,$DomainDn") 'Tier0' 'AdminSDHolder' $false
+    foreach ($c in $Custom) { if ($c) { & $set $c.Trim() 'Tier0' 'Manuell definiert' $true } }
+
+    foreach ($t in $Targets) {
+        if ($t.Type -ne 'OU' -and $t.Type -ne 'Container') { continue }
+        $rdn = ($t.Dn -split '(?<!\\),')[0] -replace '^(OU|CN)=', ''
+        if ($rdn -match '(^|[^a-z0-9])(tier[\s_-]?0|t0)([^a-z0-9]|$)') { & $set $t.Dn 'Tier0' 'Name deutet auf Tier-0 hin' $true }
+        elseif ($rdn -match 'admin|privileg|domain controllers|\bpam\b|\bpim\b|service[\s_-]?account') { & $set $t.Dn 'Privileged' 'Name deutet auf administrative/privilegierte OU hin' $true }
+    }
+    try {
+        $adm = Get-ADObject -SearchBase $DomainDn -LDAPFilter '(&(adminCount=1)(|(objectClass=user)(objectClass=group)))' -Properties adminCount @srv
+        foreach ($o in $adm) {
+            $parent = ([string]$o.DistinguishedName -split '(?<!\\),', 2)[1]
+            if ($parent -and $parent -notmatch '^CN=Builtin,') { & $set $parent 'Privileged' 'Enthaelt Objekte mit adminCount=1' $false }
+        }
+    }
+    catch { Write-Log "adminCount-Abfrage fehlgeschlagen: $($_.Exception.Message)" 'WARN' }
+
+    foreach ($t in $Targets) {
+        $dl = $t.Dn.ToLowerInvariant()
+        foreach ($s in $seeds) {
+            if ($dl.EndsWith(',' + $s.Key)) {
+                $parentTier = $s.Tier
+                if (-not $map.ContainsKey($dl) -or ($parentTier -eq 'Tier0' -and $map[$dl].Tier -ne 'Tier0')) {
+                    $map[$dl] = @{ Tier = $parentTier; Reason = 'Untergeordnet zu privilegierter OU' }
+                }
+            }
+        }
+    }
+    return $map
+}
+
+function Invoke-ADAssessment {
+    [CmdletBinding()]
+    param(
+        [string[]]$Users = @(), [string[]]$Groups = @(), [string]$Server,
+        [string[]]$CustomPrivilegedOUs = @(), [switch]$IncludeContainers, [int]$MaxDepth = 32
+    )
+    $Cache = @{ Groups = @{}; BySid = @{}; Server = $Server }
+    $started = Get-Date
+    Set-Progress 2 'Verbinde mit Active Directory ...'
+    $srv = Get-SrvArgs
+    $domain = Get-ADDomain @srv
+    $domainDn = [string]$domain.DistinguishedName
+    Write-Log "Domaene: $($domain.DNSRoot) ($domainDn)"
+
+    # 1) Eingabeobjekte aufloesen
+    Set-Progress 5 'Loese Benutzer und Gruppen auf ...'
+    $principals = New-Object System.Collections.Generic.List[object]
+    $unresolved = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($u in $Users) {
+        $p = Resolve-Principal -Identity $u -Type User
+        if (-not $p) { $unresolved.Add("User: $u"); continue }
+        if (-not $seen.ContainsKey($p.Sid)) { $seen[$p.Sid] = $true; $principals.Add($p) }
+    }
+    foreach ($g in $Groups) {
+        $p = Resolve-Principal -Identity $g -Type Group
+        if (-not $p) { $unresolved.Add("Group: $g"); continue }
+        if (-not $seen.ContainsKey($p.Sid)) { $seen[$p.Sid] = $true; $principals.Add($p) }
+    }
+    if ($principals.Count -eq 0) { throw 'Keines der angegebenen Objekte konnte aufgeloest werden.' }
+
+    # 2) Gruppenmitgliedschaften (direkt, verschachtelt, Primary Group)
+    $allRows = New-Object System.Collections.Generic.List[object]
+    $tokens = @{}
+    $i = 0
+    foreach ($p in $principals) {
+        $i++
+        if ($Sync.Cancel) { throw 'Abgebrochen.' }
+        Set-Progress (8 + [int](27 * $i / $principals.Count)) ("Gruppenanalyse {0}/{1}: {2}" -f $i, $principals.Count, $p.Name)
+        $rows = @(Get-MembershipTree -Principal $p -MaxDepth $MaxDepth)
+        foreach ($r in $rows) { $allRows.Add($r) }
+        $tokens[$p.Sid] = Get-EffectiveSids -Principal $p -Rows $rows
+    }
+
+    # 3) GUID-Aufloesung, Ziele (Domain-Root, OUs, AdminSDHolder), privilegierte Objekte
+    Set-Progress 36 'Lade Schema- und Extended-Rights-GUIDs ...'
+    $guidMap = Get-GuidMap
+    if ($Sync.Cancel) { throw 'Abgebrochen.' }
+    Set-Progress 42 'Lese OUs und ACLs ...'
+    $targets = Get-AssessmentTargets -DomainDn $domainDn -IncludeContainers ([bool]$IncludeContainers)
+    Write-Log "$($targets.Count) Zielobjekte (Domain-Root, OUs, AdminSDHolder$(if ($IncludeContainers) { ', Container' }))"
+    $privMap = Get-PrivilegedTargetMap -DomainDn $domainDn -Targets $targets -Custom $CustomPrivilegedOUs
+
+    # 4) ACL-/Delegationsanalyse
+    $findings = New-Object System.Collections.Generic.List[object]
+    $aceCache = @{}
+    $n = $targets.Count
+    $idx = 0
+    foreach ($t in $targets) {
+        $idx++
+        if ($Sync.Cancel) { throw 'Abgebrochen.' }
+        if (($idx % 10) -eq 0 -or $idx -eq $n) { Set-Progress (50 + [int](45 * $idx / $n)) ("ACL-Analyse {0}/{1}" -f $idx, $n) -NoLog }
+        $tierInfo = $privMap[$t.Dn.ToLowerInvariant()]
+        $tier = if ($tierInfo) { $tierInfo.Tier } else { 'Standard' }
+        if (-not $t.Acl) { Write-Log "Keine ACL lesbar: $($t.Dn)" 'WARN'; continue }
+        $rules = $t.Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        $bySid = @{}
+        foreach ($r in $rules) {
+            $k = $r.IdentityReference.Value
+            if (-not $bySid.ContainsKey($k)) { $bySid[$k] = New-Object System.Collections.Generic.List[object] }
+            $bySid[$k].Add($r)
+        }
+        foreach ($p in $principals) {
+            $tok = $tokens[$p.Sid]
+            $denyHits = New-Object System.Collections.Generic.List[object]
+            foreach ($sid in $tok.Keys) {
+                if ($bySid.ContainsKey($sid)) { foreach ($r in $bySid[$sid]) { if ($r.AccessControlType -eq 'Deny') { $denyHits.Add($r) } } }
+            }
+            foreach ($sid in $tok.Keys) {
+                if (-not $bySid.ContainsKey($sid)) { continue }
+                $ent = $tok[$sid]
+                foreach ($r in $bySid[$sid]) {
+                    $key = '{0}|{1}|{2}' -f [int]$r.ActiveDirectoryRights, $r.ObjectType, $r.InheritedObjectType
+                    if (-not $aceCache.ContainsKey($key)) { $aceCache[$key] = Get-AceInfo -Rule $r -GuidMap $guidMap }
+                    $info = $aceCache[$key]
+                    $isDeny = ($r.AccessControlType -eq 'Deny')
+                    if (-not $isDeny -and $ent.Source -eq 'WellKnown' -and $info.Score -lt 30) { continue }
+
+                    $applies = switch ([string]$r.InheritanceType) {
+                        'None' { 'Nur dieses Objekt' }
+                        'All' { 'Dieses Objekt und alle untergeordneten Objekte' }
+                        'Descendents' { 'Nur untergeordnete Objekte' }
+                        'Children' { 'Nur direkte Kinder' }
+                        'SelfAndChildren' { 'Dieses Objekt und direkte Kinder' }
+                        default { [string]$r.InheritanceType }
+                    }
+                    $overlap = $false
+                    if (-not $isDeny -and $info.Score -ge 30) {
+                        foreach ($d in $denyHits) {
+                            if (([int]$d.ActiveDirectoryRights -band [int]$r.ActiveDirectoryRights) -ne 0 -and
+                                ([guid]$d.ObjectType -eq [guid]::Empty -or [guid]$r.ObjectType -eq [guid]::Empty -or [guid]$d.ObjectType -eq [guid]$r.ObjectType)) { $overlap = $true; break }
+                        }
+                    }
+                    $risk = if ($isDeny) { [pscustomobject]@{ Score = 0; Rating = 'INFO' } }
+                            else { Get-RiskRating -Base $info.Score -Tier $tier -Level $ent.Level -AppliesTo $applies }
+                    $reason = if ($isDeny) { 'Deny-ACE: schraenkt Allow-Rechte ein und ist nur informativ.' }
+                              else {
+                                  $how = switch ($ent.Source) { 'Direct' { 'direkte' } 'Group' { 'ueber eine Gruppe vermittelte' } 'Nested Group' { "ueber $($ent.Level) Verschachtelungsebenen vermittelte" } default { 'ueber eine Well-Known-Gruppe vermittelte' } }
+                                  "$($p.Name) hat eine $how Berechtigung '$($info.Permission)' auf $($t.Type) '$($t.Dn)' (Tier: $tier)."
+                              }
+                    $findings.Add([pscustomobject]@{
+                        Principal = $p.Name; PrincipalType = $p.Class
+                        Target = $t.Dn; TargetType = $t.Type; Tier = $tier
+                        Trustee = $ent.Name; TrusteeSid = $sid
+                        Permission = $info.Permission; AccessType = [string]$r.AccessControlType
+                        Source = $ent.Source; NestedLevel = $ent.Level
+                        Origin = $(if ($r.IsInherited) { 'Inherited' } else { 'Explicit' })
+                        Score = $risk.Score; Risk = $risk.Rating; DenyOverlap = $overlap
+                        AppliesTo = $applies; Rights = $info.Rights
+                        ObjectType = $info.ObjectTypeName; InheritedObjectType = $info.InheritedObjectTypeName
+                        AccessPath = ('{0} -> {1} -> {2}' -f $ent.Path, $t.Dn, $info.Permission)
+                        Reason = $reason
+                    })
+                }
+            }
+        }
+    }
+
+    # 5) Kennzahlen
+    $f = $findings.ToArray()
+    $allow = @($f | Where-Object { $_.AccessType -eq 'Allow' })
+    $stats = [ordered]@{
+        UsersAnalyzed        = @($principals | Where-Object { $_.Class -ne 'group' }).Count
+        GroupsAnalyzed       = @($principals | Where-Object { $_.Class -eq 'group' }).Count
+        NestedGroups         = @($allRows | Where-Object { $_.Depth -ge 2 -and -not $_.Cycle } | Select-Object -ExpandProperty GroupSid -Unique).Count
+        CyclesDetected       = @($allRows | Where-Object { $_.Cycle }).Count
+        TargetsAnalyzed      = $targets.Count
+        Delegations          = $allow.Count
+        CriticalFindings     = @($allow | Where-Object { $_.Risk -like 'CRITICAL*' }).Count
+        HighFindings         = @($allow | Where-Object { $_.Risk -eq 'HIGH' }).Count
+        MediumFindings       = @($allow | Where-Object { $_.Risk -eq 'MEDIUM' }).Count
+        LowFindings          = @($allow | Where-Object { $_.Risk -eq 'LOW' }).Count
+        PrivilegedOuAccess   = @($allow | Where-Object { $_.Tier -ne 'Standard' -and $_.Score -ge 30 }).Count
+        IndirectPaths        = @($allow | Where-Object { $_.Source -in 'Group', 'Nested Group' }).Count
+        PrivilegedGroupPaths = @($allRows | Where-Object { $_.PrivilegedGroup -and -not $_.Cycle }).Count
+    }
+    Set-Progress 100 ("Fertig: {0} Delegierungen, {1} kritisch." -f $stats.Delegations, $stats.CriticalFindings)
+
+    [pscustomobject]@{
+        Scope = [pscustomobject]@{
+            Domain = [string]$domain.DNSRoot; DomainDn = $domainDn; Server = $Server
+            RunBy = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            Started = $started; Finished = Get-Date; MaxDepth = $MaxDepth
+            IncludeContainers = [bool]$IncludeContainers; CustomPrivilegedOUs = @($CustomPrivilegedOUs)
+        }
+        Principals  = @($principals | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Class = $_.Class; Sid = $_.Sid; Dn = $_.Dn } })
+        Unresolved  = $unresolved.ToArray()
+        Memberships = $allRows.ToArray()
+        Targets     = @($targets | ForEach-Object {
+                $ti = $privMap[$_.Dn.ToLowerInvariant()]
+                [pscustomobject]@{ Dn = $_.Dn; Type = $_.Type; Tier = $(if ($ti) { $ti.Tier } else { 'Standard' }); Reason = $(if ($ti) { $ti.Reason } else { '' }) } })
+        Findings    = $f
+        Stats       = [pscustomobject]$stats
+        Limitations = @(
+            'Effektive Rechte werden als Vereinigung der Allow-ACEs aller Token-SIDs ermittelt; Deny-ACEs werden markiert (DenyOverlap), aber nicht rechnerisch abgezogen.',
+            'Nicht betrachtet: SID-History, domaenenuebergreifende Gruppen ausserhalb der gewaehlten Domaene, Gruppenrichtlinien-Zuweisungen, Berechtigungen auf Leaf-Objekten (nur Domain-Root, OUs, AdminSDHolder und optional Container).',
+            'Der ActiveDirectory-Modul-Zugriff erfolgt ueber ADWS (TCP 9389), nicht direkt ueber LDAP/LDAPS.'
+        )
+    }
+}
+
+$script:AnalysisFunctions = @(
+    'Write-Log', 'Set-Progress', 'Get-SrvArgs', 'ConvertTo-LdapEscaped', 'Get-GroupScopeName', 'Get-PrivilegedGroupLabel',
+    'Test-Tier0Group', 'Convert-ToPrincipal', 'Resolve-Principal', 'Get-CachedGroup', 'New-MembershipRow', 'Get-MembershipTree',
+    'Get-EffectiveSids', 'Get-GuidMap', 'Resolve-GuidName', 'Get-AceInfo', 'Get-RiskRating', 'Get-AssessmentTargets',
+    'Get-PrivilegedTargetMap', 'Invoke-ADAssessment'
+)
+
+#endregion
+
+#region ===================== Export / Reporting =====================
+
+function ConvertTo-HtmlText { param($Text) [System.Net.WebUtility]::HtmlEncode([string]$Text) }
+
+function Get-RiskCssClass {
+    param([string]$Risk)
+    if ($Risk -eq 'CRITICAL (Tier-0)') { return 'r-t0' }
+    if ($Risk -like 'CRITICAL*') { return 'r-crit' }
+    if ($Risk -eq 'HIGH') { return 'r-high' }
+    if ($Risk -eq 'MEDIUM') { return 'r-med' }
+    if ($Risk -eq 'INFO') { return 'r-info' }
+    return 'r-low'
+}
+
+function ConvertTo-HtmlTable {
+    param($Items, [string[]]$Columns)
+    $list = @($Items)
+    if ($list.Count -eq 0) { return '<p class="muted">Keine Eintraege.</p>' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<table><thead><tr>')
+    foreach ($c in $Columns) { [void]$sb.Append('<th>' + (ConvertTo-HtmlText $c) + '</th>') }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($it in $list) {
+        $cls = if ($it.PSObject.Properties['Risk']) { Get-RiskCssClass $it.Risk } else { '' }
+        [void]$sb.Append("<tr class=`"$cls`">")
+        foreach ($c in $Columns) {
+            $v = ConvertTo-HtmlText $it.$c
+            if ($c -eq 'Risk') { $v = "<span class=`"pill $cls`">$v</span>" }
+            [void]$sb.Append("<td>$v</td>")
+        }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</tbody></table>')
+    return $sb.ToString()
+}
+
+function ConvertTo-AssessmentHtml {
+    param($Result)
+    $s = $Result.Stats; $sc = $Result.Scope
+    $allow = @($Result.Findings | Where-Object { $_.AccessType -eq 'Allow' })
+    $relevant = @($allow | Where-Object { $_.Score -ge 30 } | Sort-Object Score -Descending)
+    $crit = @($allow | Where-Object { $_.Risk -like 'CRITICAL*' } | Sort-Object Score -Descending)
+    $privT = @($Result.Targets | Where-Object { $_.Tier -ne 'Standard' })
+    $nested = @($Result.Memberships | Where-Object { $_.Depth -ge 2 -or $_.Cycle })
+
+    $rec = New-Object System.Collections.Generic.List[string]
+    if ($crit.Count -gt 0) { $rec.Add('Kritische Delegierungen (GenericAll, WriteDACL, WriteOwner) auf OUs pruefen und auf das notwendige Minimum zurueckfuehren; Zuweisung an Gruppen statt Einzelkonten und nach dem Prinzip der geringsten Rechte.') }
+    if (@($crit | Where-Object { $_.Risk -eq 'CRITICAL (Tier-0)' }).Count -gt 0) { $rec.Add('Berechtigungen auf Tier-0-Objekten (Domain-Root, Domain Controllers, AdminSDHolder) ausschliesslich Tier-0-Administratoren zuweisen und Delegierungen fuer Nicht-Tier-0-Konten entfernen.') }
+    if (@($Result.Memberships | Where-Object { $_.Risk -eq 'CRITICAL' -and $_.Depth -ge 2 }).Count -gt 0) { $rec.Add('Verschachtelte Mitgliedschaften in Tier-0-Gruppen aufloesen; privilegierte Gruppen nur direkt und nur mit dedizierten Administratorkonten befuellen.') }
+    if ($s.CyclesDetected -gt 0) { $rec.Add('Zyklische Gruppenverschachtelungen bereinigen.') }
+    if ($s.IndirectPaths -gt 0) { $rec.Add('Indirekte Berechtigungspfade ueber Gruppen dokumentieren und regelmaessig rezertifizieren; unnoetige Verschachtelungsebenen reduzieren.') }
+    $rec.Add('Tiering-Modell umsetzen (Tier 0/1/2), administrative Konten trennen, Protected Users und Authentication Policies nutzen.')
+    $rec.Add('Aenderungen an ACLs (Ereignis 5136) und Gruppenmitgliedschaften (4728, 4732, 4756) ueberwachen; Assessment regelmaessig wiederholen.')
+    $recHtml = ($rec | ForEach-Object { '<li>' + (ConvertTo-HtmlText $_) + '</li>' }) -join ''
+    $limHtml = ($Result.Limitations | ForEach-Object { '<li>' + (ConvertTo-HtmlText $_) + '</li>' }) -join ''
+
+    $critCards = if ($crit.Count -eq 0) { '<p class="muted">Keine kritischen Befunde.</p>' } else {
+        (($crit | Select-Object -First 100 | ForEach-Object {
+            $cls = Get-RiskCssClass $_.Risk
+            "<div class=`"card $cls`"><b>CRITICAL FINDING</b> &ndash; $(ConvertTo-HtmlText $_.Principal)<br>Pfad: $(ConvertTo-HtmlText $_.AccessPath)<br>Berechtigung: <b>$(ConvertTo-HtmlText $_.Permission)</b> &middot; Risiko: $(ConvertTo-HtmlText $_.Risk) (Score $($_.Score))<br><span class=`"muted`">$(ConvertTo-HtmlText $_.Reason)</span></div>"
+        }) -join "`n")
+    }
+
+    $sections = @(
+        @{ T = '1. Executive Summary'; B = "<p>Analysiert wurden <b>$($s.UsersAnalyzed)</b> Benutzer und <b>$($s.GroupsAnalyzed)</b> Gruppen in <b>$(ConvertTo-HtmlText $sc.Domain)</b>. Es wurden <b>$($s.Delegations)</b> Delegierungen auf <b>$($s.TargetsAnalyzed)</b> Zielobjekten gefunden, davon <b>$($s.CriticalFindings)</b> kritisch, <b>$($s.HighFindings)</b> hoch, <b>$($s.MediumFindings)</b> mittel und <b>$($s.LowFindings)</b> niedrig. <b>$($s.PrivilegedOuAccess)</b> Berechtigungen betreffen privilegierte Objekte, <b>$($s.IndirectPaths)</b> entstehen indirekt ueber Gruppen.</p>" }
+        @{ T = '2. Assessment Scope'; B = "<p>Domaene: $(ConvertTo-HtmlText $sc.Domain) ($(ConvertTo-HtmlText $sc.DomainDn))<br>Ausgefuehrt von: $(ConvertTo-HtmlText $sc.RunBy)<br>Zeitraum: $($sc.Started) bis $($sc.Finished)<br>Max. Verschachtelungstiefe: $($sc.MaxDepth) &middot; Container einbezogen: $($sc.IncludeContainers)</p><p>Methodik: strikt lesend; effektive Rechte aus Token-SIDs (direkt, verschachtelt, Primary Group, Everyone, Authenticated Users) gegen die DACL.</p><ul>$limHtml</ul>" }
+        @{ T = '3. Analysierte Benutzer und Gruppen'; B = (ConvertTo-HtmlTable $Result.Principals @('Name', 'Class', 'Sid', 'Dn')) + $(if ($Result.Unresolved.Count) { '<p class="muted">Nicht aufgeloest: ' + (ConvertTo-HtmlText ($Result.Unresolved -join ', ')) + '</p>' } else { '' }) }
+        @{ T = '4. Gruppenmitgliedschaften'; B = ConvertTo-HtmlTable $Result.Memberships @('Principal', 'Group', 'Scope', 'Category', 'Relation', 'Depth', 'PrivilegedGroup', 'Risk', 'GroupSid') }
+        @{ T = '5. Nested Group Analysis'; B = ConvertTo-HtmlTable $nested @('Principal', 'Group', 'Depth', 'Relation', 'PrivilegedGroup', 'Risk', 'Path') }
+        @{ T = '6. OU Delegation Analysis'; B = ConvertTo-HtmlTable $relevant @('Principal', 'Target', 'Trustee', 'Permission', 'Source', 'NestedLevel', 'Origin', 'Risk', 'Score') }
+        @{ T = '7. Privileged OU Analysis'; B = (ConvertTo-HtmlTable $privT @('Dn', 'Type', 'Tier', 'Reason')) + '<h3>Berechtigungen auf privilegierten Objekten</h3>' + (ConvertTo-HtmlTable (@($relevant | Where-Object { $_.Tier -ne 'Standard' })) @('Principal', 'Target', 'Tier', 'Permission', 'Source', 'Risk')) }
+        @{ T = '8. Critical Findings'; B = $critCards }
+        @{ T = '9. Risk Assessment'; B = "<p>Bewertung je ACE: Basispunkte nach Recht (ReadProperty 5, WriteProperty 30&ndash;65, CreateChild 30&ndash;45, GenericWrite 70, WriteDACL/WriteOwner 90, GenericAll 100), Zuschlag fuer Tier-0 (+10) bzw. privilegierte Objekte (+5), Vererbung auf Untergeordnete (+3). Verschachtelung erhoeht nur den angezeigten Score (max. +6), nie die Risikokategorie. Kategorien: CRITICAL ab 90, HIGH ab 60, MEDIUM ab 30, sonst LOW.</p><table><tr><th>Kategorie</th><th>Anzahl</th></tr><tr class='r-crit'><td>CRITICAL</td><td>$($s.CriticalFindings)</td></tr><tr class='r-high'><td>HIGH</td><td>$($s.HighFindings)</td></tr><tr class='r-med'><td>MEDIUM</td><td>$($s.MediumFindings)</td></tr><tr class='r-low'><td>LOW</td><td>$($s.LowFindings)</td></tr></table>" }
+        @{ T = '10. Technische Details und betroffene ACLs'; B = ConvertTo-HtmlTable (@($Result.Findings | Where-Object { $_.Score -ge 30 -or $_.AccessType -eq 'Deny' } | Sort-Object Score -Descending)) @('Principal', 'Target', 'Trustee', 'TrusteeSid', 'AccessType', 'Rights', 'ObjectType', 'InheritedObjectType', 'AppliesTo', 'Origin', 'DenyOverlap', 'Risk') }
+        @{ T = '11. Handlungsempfehlungen'; B = "<ol>$recHtml</ol>" }
+    )
+    $body = ($sections | ForEach-Object { "<h2>$(ConvertTo-HtmlText $_.T)</h2>`n$($_.B)" }) -join "`n"
+
+    @"
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><title>AD Security &amp; Delegation Assessment</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;background:#0f1419;color:#e6edf3;margin:0;padding:32px;font-size:13px}
+h1{margin:0 0 4px}h2{margin-top:36px;border-bottom:1px solid #2d3642;padding-bottom:6px}.muted{color:#8b98a5}
+table{border-collapse:collapse;width:100%;margin:10px 0;font-size:12px}th,td{border:1px solid #2d3642;padding:5px 8px;text-align:left;vertical-align:top;word-break:break-word}
+th{background:#1c232c}tr.r-t0{background:rgba(182,35,36,.30)}tr.r-crit{background:rgba(248,81,73,.22)}tr.r-high{background:rgba(240,136,62,.20)}tr.r-med{background:rgba(227,179,65,.16)}tr.r-low{background:rgba(46,160,67,.10)}
+.pill{padding:1px 8px;border-radius:10px;font-weight:600}.pill.r-t0{background:#b62324}.pill.r-crit{background:#f85149;color:#fff}.pill.r-high{background:#f0883e;color:#111}.pill.r-med{background:#e3b341;color:#111}.pill.r-low{background:#2ea043}.pill.r-info{background:#444}
+.card{border-left:5px solid;padding:8px 12px;margin:8px 0;background:#161b22}.card.r-t0{border-color:#b62324}.card.r-crit{border-color:#f85149}
+@media print{body{background:#fff;color:#000}th{background:#eee}.card{background:#fafafa}}
+</style></head><body>
+<h1>Active Directory Security &amp; Delegation Assessment</h1>
+<div class="muted">Domaene $(ConvertTo-HtmlText $sc.Domain) &middot; erstellt $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div>
+$body
+</body></html>
+"@
+}
+
+function Export-AssessmentResult {
+    param($Result, [string]$Directory, [string[]]$Formats = @('CSV', 'JSON', 'HTML'), [switch]$Pdf)
+    [void](New-Item -ItemType Directory -Path $Directory -Force)
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $out = New-Object System.Collections.Generic.List[string]
+    if ($Formats -contains 'CSV') {
+        $p1 = Join-Path $Directory "ADAssessment_Memberships_$stamp.csv"
+        $p2 = Join-Path $Directory "ADAssessment_Delegations_$stamp.csv"
+        $Result.Memberships | Select-Object * | Export-Csv -LiteralPath $p1 -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+        $Result.Findings | Select-Object * | Export-Csv -LiteralPath $p2 -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+        $out.Add($p1); $out.Add($p2)
+    }
+    if ($Formats -contains 'JSON') {
+        $p = Join-Path $Directory "ADAssessment_$stamp.json"
+        $Result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $p -Encoding UTF8
+        $out.Add($p)
+    }
+    if ($Formats -contains 'HTML' -or $Pdf) {
+        $p = Join-Path $Directory "ADAssessment_Report_$stamp.html"
+        ConvertTo-AssessmentHtml -Result $Result | Set-Content -LiteralPath $p -Encoding UTF8
+        $out.Add($p)
+        if ($Pdf) {
+            $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") |
+                Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if ($edge) {
+                $pdfPath = [System.IO.Path]::ChangeExtension($p, 'pdf')
+                Start-Process -FilePath $edge -Wait -WindowStyle Hidden -ArgumentList @('--headless', '--disable-gpu', "--print-to-pdf=`"$pdfPath`"", "`"$(([uri]$p).AbsoluteUri)`"")
+                if (Test-Path -LiteralPath $pdfPath) { $out.Add($pdfPath) }
+            }
+            else { Write-Log 'PDF nicht erstellt: Microsoft Edge nicht gefunden (HTML kann ueber "Drucken als PDF" gespeichert werden).' 'WARN' }
+        }
+    }
+    return $out.ToArray()
+}
+
+function Import-InputCsv {
+    param([string]$Path)
+    $u = @(); $g = @()
+    foreach ($r in (Import-Csv -LiteralPath $Path -Encoding UTF8)) {
+        if (-not $r.Identity) { continue }
+        if ($r.Type -match '^(?i)user|benutzer') { $u += $r.Identity.Trim() }
+        elseif ($r.Type -match '^(?i)group|gruppe') { $g += $r.Identity.Trim() }
+    }
+    [pscustomobject]@{ Users = $u; Groups = $g }
+}
+
+#endregion
+
+#region ===================== GUI =====================
+
+$script:GuiXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AD Security &amp; Delegation Assessment" Height="800" Width="1360" MinHeight="600" MinWidth="1000"
+        WindowStartupLocation="CenterScreen" Background="#0F1419" Foreground="#E6EDF3" FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style x:Key="Nav" TargetType="RadioButton">
+      <Setter Property="Foreground" Value="#C9D1D9"/><Setter Property="FontSize" Value="14"/><Setter Property="Height" Value="42"/>
+      <Setter Property="Margin" Value="8,2"/><Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="RadioButton">
+        <Border x:Name="bd" CornerRadius="6" Padding="14,0" Background="Transparent"><ContentPresenter VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#1C232C"/></Trigger>
+          <Trigger Property="IsChecked" Value="True"><Setter TargetName="bd" Property="Background" Value="#1F3A63"/><Setter Property="Foreground" Value="White"/></Trigger>
+        </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="Btn" TargetType="Button">
+      <Setter Property="Foreground" Value="White"/><Setter Property="Background" Value="#3B82F6"/><Setter Property="Padding" Value="16,8"/>
+      <Setter Property="Margin" Value="0,0,8,0"/><Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="bd" CornerRadius="5" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.85"/></Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.4"/></Trigger>
+        </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style TargetType="TextBox"><Setter Property="Background" Value="#0D1117"/><Setter Property="Foreground" Value="#E6EDF3"/><Setter Property="BorderBrush" Value="#2D3642"/><Setter Property="CaretBrush" Value="White"/><Setter Property="Padding" Value="8,6"/></Style>
+    <Style TargetType="ComboBox"><Setter Property="Foreground" Value="Black"/><Setter Property="Padding" Value="6,4"/></Style>
+    <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#C9D1D9"/></Style>
+    <Style TargetType="DataGrid">
+      <Setter Property="Background" Value="#161B22"/><Setter Property="Foreground" Value="#E6EDF3"/><Setter Property="RowBackground" Value="#161B22"/>
+      <Setter Property="AlternatingRowBackground" Value="#1C232C"/><Setter Property="BorderBrush" Value="#2D3642"/><Setter Property="GridLinesVisibility" Value="Horizontal"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="#2D3642"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="HeadersVisibility" Value="Column"/><Setter Property="AutoGenerateColumns" Value="True"/>
+    </Style>
+    <Style TargetType="DataGridColumnHeader"><Setter Property="Background" Value="#1C232C"/><Setter Property="Foreground" Value="White"/><Setter Property="Padding" Value="8,6"/><Setter Property="BorderBrush" Value="#2D3642"/><Setter Property="BorderThickness" Value="0,0,1,0"/></Style>
+    <Style TargetType="DataGridCell"><Setter Property="Foreground" Value="#E6EDF3"/><Setter Property="BorderThickness" Value="0"/></Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <Border Background="#161B22" BorderBrush="#2D3642" BorderThickness="0,0,1,0">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Margin="18,22,18,22"><TextBlock Text="AD ASSESSMENT" FontSize="17" FontWeight="Bold" Foreground="White"/><TextBlock Text="Security &amp; Delegation" FontSize="12" Foreground="#8B98A5"/></StackPanel>
+        <StackPanel DockPanel.Dock="Bottom" Margin="18,10,18,16"><TextBlock x:Name="TxtConnState" Text="Nicht verbunden" Foreground="#8B98A5" FontSize="12" TextWrapping="Wrap"/><TextBlock Text="Read-only Modus" Foreground="#2EA043" FontSize="11" Margin="0,4,0,0"/></StackPanel>
+        <StackPanel>
+          <RadioButton x:Name="NavInput" Style="{StaticResource Nav}" Content="Assessment-Input" IsChecked="True" GroupName="nav"/>
+          <RadioButton x:Name="NavDashboard" Style="{StaticResource Nav}" Content="Dashboard" GroupName="nav"/>
+          <RadioButton x:Name="NavMembership" Style="{StaticResource Nav}" Content="Gruppenmitgliedschaften" GroupName="nav"/>
+          <RadioButton x:Name="NavDelegation" Style="{StaticResource Nav}" Content="OU-Delegierungen" GroupName="nav"/>
+          <RadioButton x:Name="NavPaths" Style="{StaticResource Nav}" Content="Berechtigungspfade" GroupName="nav"/>
+          <RadioButton x:Name="NavExport" Style="{StaticResource Nav}" Content="Reports &amp; Export" GroupName="nav"/>
+          <RadioButton x:Name="NavLog" Style="{StaticResource Nav}" Content="Protokoll" GroupName="nav"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+    <Grid Grid.Column="1" Margin="24">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+      <TextBlock x:Name="TxtPageTitle" Text="Assessment-Input" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,16"/>
+      <Grid Grid.Row="1">
+        <ScrollViewer x:Name="PageInput" VerticalScrollBarVisibility="Auto"><StackPanel>
+          <Border Background="#161B22" BorderBrush="#2D3642" BorderThickness="1" CornerRadius="8" Padding="18" Margin="0,0,0,14"><StackPanel>
+            <TextBlock Text="Verbindung (Windows-Anmeldedaten, ActiveDirectory-Modul)" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,10"/>
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+              <StackPanel><TextBlock Text="Forest" Foreground="#8B98A5" Margin="0,0,0,4"/><ComboBox x:Name="CmbForest" IsEditable="True"/></StackPanel>
+              <StackPanel Grid.Column="2"><TextBlock Text="Domaene" Foreground="#8B98A5" Margin="0,0,0,4"/><ComboBox x:Name="CmbDomain" IsEditable="True"/></StackPanel>
+              <StackPanel Grid.Column="4"><TextBlock Text="Domain Controller (optional)" Foreground="#8B98A5" Margin="0,0,0,4"/><TextBox x:Name="TxtServer"/></StackPanel>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0"><Button x:Name="BtnDiscover" Style="{StaticResource Btn}" Background="#30363D" Content="Forest ermitteln"/><CheckBox x:Name="ChkContainers" Content="Container (CN=Users, CN=Computers ...) einbeziehen" VerticalAlignment="Center"/></StackPanel>
+          </StackPanel></Border>
+          <Border Background="#161B22" BorderBrush="#2D3642" BorderThickness="1" CornerRadius="8" Padding="18" Margin="0,0,0,14"><StackPanel>
+            <TextBlock Text="Zu analysierende Objekte" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,4"/>
+            <TextBlock Text="Je Zeile: SamAccountName, DistinguishedName oder ObjectSID." Foreground="#8B98A5" Margin="0,0,0,10"/>
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+              <StackPanel><TextBlock Text="Benutzer" Foreground="#8B98A5" Margin="0,0,0,4"/><TextBox x:Name="TxtUsers" Height="150" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/></StackPanel>
+              <StackPanel Grid.Column="2"><TextBlock Text="Sicherheitsgruppen" Foreground="#8B98A5" Margin="0,0,0,4"/><TextBox x:Name="TxtGroups" Height="150" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/></StackPanel>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0"><Button x:Name="BtnImportCsv" Style="{StaticResource Btn}" Background="#30363D" Content="CSV importieren ..."/><Button x:Name="BtnClear" Style="{StaticResource Btn}" Background="#30363D" Content="Leeren"/><TextBlock x:Name="TxtInputCount" Foreground="#8B98A5" VerticalAlignment="Center" Margin="8,0,0,0"/></StackPanel>
+          </StackPanel></Border>
+          <Border Background="#161B22" BorderBrush="#2D3642" BorderThickness="1" CornerRadius="8" Padding="18"><StackPanel>
+            <TextBlock Text="Eigene privilegierte OUs (optional, je Zeile ein DistinguishedName)" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,10"/>
+            <TextBox x:Name="TxtCustomOUs" Height="70" AcceptsReturn="True" FontFamily="Consolas"/>
+            <StackPanel Orientation="Horizontal" Margin="0,14,0,0"><Button x:Name="BtnStart" Style="{StaticResource Btn}" Background="#2EA043" Content="Assessment starten"/><Button x:Name="BtnCancel" Style="{StaticResource Btn}" Background="#B62324" Content="Abbrechen" IsEnabled="False"/></StackPanel>
+          </StackPanel></Border>
+        </StackPanel></ScrollViewer>
+
+        <ScrollViewer x:Name="PageDashboard" Visibility="Collapsed" VerticalScrollBarVisibility="Auto"><StackPanel>
+          <UniformGrid x:Name="PanelKpi" Columns="4"/>
+          <TextBlock Text="Risikoverteilung (Allow-Delegierungen)" FontWeight="SemiBold" FontSize="15" Margin="0,16,0,8"/>
+          <StackPanel x:Name="PanelBars"/>
+        </StackPanel></ScrollViewer>
+
+        <Grid x:Name="PageMembership" Visibility="Collapsed"><DataGrid x:Name="GridMembership"/></Grid>
+
+        <DockPanel x:Name="PageDelegation" Visibility="Collapsed">
+          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Suche:" VerticalAlignment="Center" Margin="0,0,8,0"/><TextBox x:Name="TxtFilter" Width="320"/>
+            <TextBlock Text="Risiko:" VerticalAlignment="Center" Margin="16,0,8,0"/>
+            <ComboBox x:Name="CmbRisk" Width="140" SelectedIndex="0"><ComboBoxItem Content="Alle"/><ComboBoxItem Content="CRITICAL"/><ComboBoxItem Content="HIGH"/><ComboBoxItem Content="MEDIUM"/><ComboBoxItem Content="LOW"/><ComboBoxItem Content="INFO"/></ComboBox>
+            <CheckBox x:Name="ChkRelevant" Content="Nur Score &gt;= 30" IsChecked="True" Margin="16,0,0,0" VerticalAlignment="Center"/>
+          </StackPanel>
+          <DataGrid x:Name="GridDelegation"/>
+        </DockPanel>
+
+        <TreeView x:Name="PagePaths" Visibility="Collapsed" Background="#161B22" BorderBrush="#2D3642" Foreground="#E6EDF3"/>
+
+        <StackPanel x:Name="PageExport" Visibility="Collapsed">
+          <TextBlock Text="Export in ein Verzeichnis (CSV, JSON, HTML-Report, optional PDF ueber Microsoft Edge)." Foreground="#8B98A5" Margin="0,0,0,12"/>
+          <StackPanel Orientation="Horizontal"><Button x:Name="BtnExportCsv" Style="{StaticResource Btn}" Content="CSV"/><Button x:Name="BtnExportJson" Style="{StaticResource Btn}" Content="JSON"/><Button x:Name="BtnExportHtml" Style="{StaticResource Btn}" Content="HTML-Report"/><Button x:Name="BtnExportAll" Style="{StaticResource Btn}" Background="#2EA043" Content="Alles exportieren"/><CheckBox x:Name="ChkPdf" Content="zusaetzlich PDF" VerticalAlignment="Center"/></StackPanel>
+          <TextBlock x:Name="TxtExportInfo" Margin="0,14,0,0" TextWrapping="Wrap" Foreground="#8B98A5"/>
+        </StackPanel>
+
+        <TextBox x:Name="PageLog" Visibility="Collapsed" IsReadOnly="True" FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap"/>
+      </Grid>
+      <Border Grid.Row="2" Background="#161B22" BorderBrush="#2D3642" BorderThickness="1" CornerRadius="6" Padding="12,8" Margin="0,14,0,0">
+        <DockPanel><ProgressBar x:Name="Progress" DockPanel.Dock="Right" Width="220" Height="10" Minimum="0" Maximum="100" Foreground="#3B82F6" Background="#0D1117" BorderThickness="0"/><TextBlock x:Name="TxtStatus" Text="Bereit." Foreground="#8B98A5" VerticalAlignment="Center"/></DockPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</Window>
+'@
+
+$script:GuiNames = 'NavInput', 'NavDashboard', 'NavMembership', 'NavDelegation', 'NavPaths', 'NavExport', 'NavLog', 'TxtPageTitle',
+    'PageInput', 'PageDashboard', 'PageMembership', 'PageDelegation', 'PagePaths', 'PageExport', 'PageLog',
+    'CmbForest', 'CmbDomain', 'TxtServer', 'BtnDiscover', 'ChkContainers', 'TxtUsers', 'TxtGroups', 'BtnImportCsv', 'BtnClear', 'TxtInputCount',
+    'TxtCustomOUs', 'BtnStart', 'BtnCancel', 'PanelKpi', 'PanelBars', 'GridMembership', 'GridDelegation', 'TxtFilter', 'CmbRisk', 'ChkRelevant',
+    'BtnExportCsv', 'BtnExportJson', 'BtnExportHtml', 'BtnExportAll', 'ChkPdf', 'TxtExportInfo', 'TxtStatus', 'Progress', 'TxtConnState'
+
+function New-Brush { param([string]$Hex) (New-Object System.Windows.Media.BrushConverter).ConvertFromString($Hex) }
+
+function Get-RiskHex {
+    param([string]$Risk)
+    if ($Risk -eq 'CRITICAL (Tier-0)') { return '#B62324' }
+    if ($Risk -like 'CRITICAL*') { return '#F85149' }
+    if ($Risk -eq 'HIGH') { return '#F0883E' }
+    if ($Risk -eq 'MEDIUM') { return '#E3B341' }
+    if ($Risk -eq 'INFO') { return '#8B98A5' }
+    return '#2EA043'
+}
+
+function ConvertFrom-Lines {
+    param([string]$Text)
+    @($Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -Unique)
+}
+
+function Update-InputCount {
+    $u = (ConvertFrom-Lines $script:ui.TxtUsers.Text).Count
+    $g = (ConvertFrom-Lines $script:ui.TxtGroups.Text).Count
+    $script:ui.TxtInputCount.Text = "$u Benutzer, $g Gruppen"
+}
+
+function Update-DelegationGrid {
+    if (-not $script:Result) { return }
+    $q = $script:ui.TxtFilter.Text.Trim()
+    $rf = [string]$script:ui.CmbRisk.Text
+    $rel = [bool]$script:ui.ChkRelevant.IsChecked
+    $items = @($script:Result.Findings | Where-Object {
+            ($rf -eq 'Alle' -or $rf -eq '' -or $_.Risk -like "$rf*") -and
+            (-not $rel -or $_.Score -ge 30 -or $_.AccessType -eq 'Deny') -and
+            (-not $q -or (($_.PSObject.Properties.Value -join ' ') -like "*$q*"))
+        } | Sort-Object Score -Descending | Select-Object Principal, Target, Tier, Trustee, Permission, AccessType, Source, NestedLevel, Origin, Score, Risk, DenyOverlap, AppliesTo, AccessPath)
+    $script:ui.GridDelegation.ItemsSource = $items
+}
+
+function Update-PathTree {
+    $tv = $script:ui.PagePaths
+    $tv.Items.Clear()
+    $lookup = @{}
+    $items = @($script:Result.Findings | Where-Object { $_.Score -ge 30 -and $_.AccessType -eq 'Allow' } | Sort-Object Score -Descending | Select-Object -First 500)
+    foreach ($f in $items) {
+        $nodes = @($f.AccessPath -split ' -> ')
+        $parent = $null
+        for ($i = 0; $i -lt $nodes.Count; $i++) {
+            $key = ($nodes[0..$i] -join ' -> ')
+            if (-not $lookup.ContainsKey($key)) {
+                $tvi = New-Object System.Windows.Controls.TreeViewItem
+                $tvi.Header = $nodes[$i]
+                $hex = if ($i -eq $nodes.Count - 1) { Get-RiskHex $f.Risk }
+                       elseif ($i -eq $nodes.Count - 2) { if ($f.Tier -eq 'Tier0') { '#F85149' } elseif ($f.Tier -eq 'Privileged') { '#F0883E' } else { '#C9D1D9' } }
+                       elseif ($i -eq 0) { '#FFFFFF' }
+                       elseif ($i -ge 2) { '#F0883E' } else { '#E3B341' }
+                $tvi.Foreground = New-Brush $hex
+                $tvi.IsExpanded = ($i -lt 1)
+                if ($parent) { [void]$parent.Items.Add($tvi) } else { [void]$tv.Items.Add($tvi) }
+                $lookup[$key] = $tvi
+            }
+            $parent = $lookup[$key]
+        }
+    }
+}
+
+function Show-Result {
+    $r = $script:Result
+    $s = $r.Stats
+    $vals = @($s.UsersAnalyzed, $s.GroupsAnalyzed, $s.NestedGroups, $s.TargetsAnalyzed, $s.Delegations, $s.CriticalFindings, $s.PrivilegedOuAccess, $s.IndirectPaths)
+    for ($i = 0; $i -lt 8; $i++) { $script:kpi[$i].Text = [string]$vals[$i] }
+    $script:ui.PanelBars.Children.Clear()
+    $total = [Math]::Max(1, ($s.CriticalFindings + $s.HighFindings + $s.MediumFindings + $s.LowFindings))
+    foreach ($b in @(@('CRITICAL', $s.CriticalFindings, '#F85149'), @('HIGH', $s.HighFindings, '#F0883E'), @('MEDIUM', $s.MediumFindings, '#E3B341'), @('LOW', $s.LowFindings, '#2EA043'))) {
+        $dp = New-Object System.Windows.Controls.DockPanel
+        $dp.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+        $lbl = New-Object System.Windows.Controls.TextBlock; $lbl.Text = $b[0]; $lbl.Width = 90; $lbl.Foreground = New-Brush '#C9D1D9'
+        $cnt = New-Object System.Windows.Controls.TextBlock; $cnt.Text = [string]$b[1]; $cnt.Width = 60; $cnt.TextAlignment = 'Right'
+        [System.Windows.Controls.DockPanel]::SetDock($cnt, 'Right')
+        $pb = New-Object System.Windows.Controls.ProgressBar; $pb.Height = 16; $pb.Minimum = 0; $pb.Maximum = $total; $pb.Value = $b[1]
+        $pb.Foreground = New-Brush $b[2]; $pb.Background = New-Brush '#0D1117'; $pb.BorderThickness = New-Object System.Windows.Thickness(0)
+        [void]$dp.Children.Add($lbl); [void]$dp.Children.Add($cnt); [void]$dp.Children.Add($pb)
+        [void]$script:ui.PanelBars.Children.Add($dp)
+    }
+    $script:ui.GridMembership.ItemsSource = @($r.Memberships | Select-Object Principal, Group, Scope, Category, Relation, Depth, PrivilegedGroup, Risk, Path, GroupSid, GroupDn)
+    Update-DelegationGrid
+    Update-PathTree
+}
+
+function Start-GuiAssessment {
+    $users = ConvertFrom-Lines $script:ui.TxtUsers.Text
+    $groups = ConvertFrom-Lines $script:ui.TxtGroups.Text
+    if ($users.Count + $groups.Count -eq 0) {
+        [System.Windows.MessageBox]::Show('Bitte mindestens einen Benutzer oder eine Gruppe angeben.', 'Eingabe fehlt') | Out-Null
+        return
+    }
+    $server = $script:ui.TxtServer.Text.Trim()
+    if (-not $server) { $server = $script:ui.CmbDomain.Text.Trim() }
+    $params = @{
+        Users = @($users); Groups = @($groups); Server = $server
+        CustomPrivilegedOUs = @(ConvertFrom-Lines $script:ui.TxtCustomOUs.Text)
+        IncludeContainers = [bool]$script:ui.ChkContainers.IsChecked; MaxDepth = 32
+    }
+    $Sync.Cancel = $false; $Sync.Done = $false; $Sync.Result = $null; $Sync.Error = $null; $Sync.Progress = 0
+    $script:Result = $null
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.ImportPSModule(@('ActiveDirectory'))
+    foreach ($fn in $script:AnalysisFunctions) {
+        $def = (Get-Command $fn -CommandType Function).Definition
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $def)))
+    }
+    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('Sync', $Sync, 'Shared state')))
+    $rs = [runspacefactory]::CreateRunspace($iss)
+    $rs.ApartmentState = 'MTA'
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+            param($p)
+            try { $Sync.Result = Invoke-ADAssessment @p }
+            catch { $Sync.Error = $_.Exception.Message }
+            finally { $Sync.Done = $true }
+        }).AddArgument($params)
+    $script:job = @{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
+    $script:ui.BtnStart.IsEnabled = $false
+    $script:ui.BtnCancel.IsEnabled = $true
+    Write-Log "Assessment gestartet: $($users.Count) Benutzer, $($groups.Count) Gruppen"
+}
+
+function Invoke-GuiExport {
+    param([string[]]$Formats)
+    if (-not $script:Result) { [System.Windows.MessageBox]::Show('Es liegt noch kein Ergebnis vor.', 'Export') | Out-Null; return }
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Zielverzeichnis fuer den Export waehlen'
+    if (Test-Path -LiteralPath $OutDir) { $dlg.SelectedPath = $OutDir }
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    try {
+        $files = Export-AssessmentResult -Result $script:Result -Directory $dlg.SelectedPath -Formats $Formats -Pdf:([bool]$script:ui.ChkPdf.IsChecked)
+        $script:ui.TxtExportInfo.Text = "Exportiert:`n" + ($files -join "`n")
+    }
+    catch { $script:ui.TxtExportInfo.Text = "Fehler: $($_.Exception.Message)" }
+}
+
+function Show-AssessmentGui {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+    [xml]$xaml = $script:GuiXaml
+    $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+    $script:ui = @{}
+    foreach ($n in $script:GuiNames) { $script:ui[$n] = $win.FindName($n) }
+    $script:Result = $null
+    $script:job = $null
+
+    # KPI-Kacheln
+    $script:kpi = @{}
+    $i = 0
+    foreach ($k in 'Benutzer', 'Gruppen', 'Nested Groups', 'Analysierte OUs/Objekte', 'Delegierungen', 'Kritische Berechtigungen', 'Privilegierte OU-Zugriffe', 'Indirekte Pfade') {
+        $b = New-Object System.Windows.Controls.Border
+        $b.Background = New-Brush '#161B22'; $b.CornerRadius = New-Object System.Windows.CornerRadius(6)
+        $b.Padding = New-Object System.Windows.Thickness(14); $b.Margin = New-Object System.Windows.Thickness(0, 0, 10, 10)
+        $b.BorderBrush = New-Brush $(if ($k -like 'Kritische*') { '#F85149' } elseif ($k -like 'Privilegierte*') { '#F0883E' } elseif ($k -like 'Indirekte*') { '#E3B341' } else { '#3B82F6' })
+        $b.BorderThickness = New-Object System.Windows.Thickness(0, 3, 0, 0)
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $l = New-Object System.Windows.Controls.TextBlock; $l.Text = $k; $l.Foreground = New-Brush '#8B98A5'; $l.FontSize = 12
+        $v = New-Object System.Windows.Controls.TextBlock; $v.Text = '-'; $v.FontSize = 28; $v.FontWeight = 'Bold'
+        [void]$sp.Children.Add($l); [void]$sp.Children.Add($v); $b.Child = $sp
+        [void]$script:ui.PanelKpi.Children.Add($b)
+        $script:kpi[$i] = $v; $i++
+    }
+
+    # Navigation
+    $script:pages = [ordered]@{
+        NavInput = @('PageInput', 'Assessment-Input'); NavDashboard = @('PageDashboard', 'Dashboard')
+        NavMembership = @('PageMembership', 'Gruppenmitgliedschaften'); NavDelegation = @('PageDelegation', 'OU-Delegierungen')
+        NavPaths = @('PagePaths', 'Berechtigungspfade'); NavExport = @('PageExport', 'Reports & Export'); NavLog = @('PageLog', 'Protokoll')
+    }
+    foreach ($navName in $script:pages.Keys) {
+        $nav = $script:ui[$navName]
+        $nav.Tag = $navName
+        $nav.Add_Checked({
+                param($s, $e)
+                foreach ($k in $script:pages.Keys) { $script:ui[$script:pages[$k][0]].Visibility = 'Collapsed' }
+                $sel = $script:pages[[string]$s.Tag]
+                $script:ui[$sel[0]].Visibility = 'Visible'
+                $script:ui.TxtPageTitle.Text = $sel[1]
+            })
+    }
+
+    # Zeilenfarben
+    foreach ($g in $script:ui.GridMembership, $script:ui.GridDelegation) {
+        $g.Add_LoadingRow({
+                param($s, $e)
+                $risk = [string]$e.Row.Item.Risk
+                $hex = (Get-RiskHex $risk).TrimStart('#')
+                $e.Row.Background = New-Brush ('#33' + $hex)
+                $e.Row.Foreground = New-Brush '#FFFFFF'
+            })
+    }
+
+    $script:ui.TxtUsers.Add_TextChanged({ Update-InputCount })
+    $script:ui.TxtGroups.Add_TextChanged({ Update-InputCount })
+    Update-InputCount
+    $script:ui.TxtFilter.Add_TextChanged({ Update-DelegationGrid })
+    $script:ui.CmbRisk.Add_SelectionChanged({ Update-DelegationGrid })
+    $script:ui.ChkRelevant.Add_Click({ Update-DelegationGrid })
+
+    $script:ui.BtnDiscover.Add_Click({
+            try {
+                $fa = @{}; if ($script:ui.CmbForest.Text.Trim()) { $fa.Server = $script:ui.CmbForest.Text.Trim() }
+                $forest = Get-ADForest @fa
+                $script:ui.CmbForest.Text = $forest.Name
+                $script:ui.CmbDomain.Items.Clear()
+                foreach ($d in $forest.Domains) { [void]$script:ui.CmbDomain.Items.Add($d) }
+                if (-not $script:ui.CmbDomain.Text) { $script:ui.CmbDomain.SelectedIndex = 0 }
+                $script:ui.TxtConnState.Text = "Forest: $($forest.Name)`n$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+                $script:ui.TxtStatus.Text = "Forest $($forest.Name) mit $(@($forest.Domains).Count) Domaene(n) gefunden."
+            }
+            catch { $script:ui.TxtStatus.Text = "Forest-Ermittlung fehlgeschlagen: $($_.Exception.Message)"; Write-Log $_.Exception.Message 'ERROR' }
+        })
+
+    $script:ui.BtnImportCsv.Add_Click({
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Filter = 'CSV (*.csv)|*.csv|Alle Dateien (*.*)|*.*'
+            if ($dlg.ShowDialog() -ne 'OK') { return }
+            try {
+                $imp = Import-InputCsv -Path $dlg.FileName
+                if ($imp.Users.Count) { $script:ui.TxtUsers.Text = ((ConvertFrom-Lines $script:ui.TxtUsers.Text) + $imp.Users | Select-Object -Unique) -join "`r`n" }
+                if ($imp.Groups.Count) { $script:ui.TxtGroups.Text = ((ConvertFrom-Lines $script:ui.TxtGroups.Text) + $imp.Groups | Select-Object -Unique) -join "`r`n" }
+                Write-Log "CSV importiert: $($dlg.FileName)"
+            }
+            catch { [System.Windows.MessageBox]::Show("CSV-Import fehlgeschlagen:`n$($_.Exception.Message)", 'Fehler') | Out-Null }
+        })
+    $script:ui.BtnClear.Add_Click({ $script:ui.TxtUsers.Clear(); $script:ui.TxtGroups.Clear() })
+    $script:ui.BtnStart.Add_Click({ Start-GuiAssessment })
+    $script:ui.BtnCancel.Add_Click({ $Sync.Cancel = $true; Write-Log 'Abbruch angefordert' 'WARN' })
+    $script:ui.BtnExportCsv.Add_Click({ Invoke-GuiExport @('CSV') })
+    $script:ui.BtnExportJson.Add_Click({ Invoke-GuiExport @('JSON') })
+    $script:ui.BtnExportHtml.Add_Click({ Invoke-GuiExport @('HTML') })
+    $script:ui.BtnExportAll.Add_Click({ Invoke-GuiExport @('CSV', 'JSON', 'HTML') })
+
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(300)
+    $timer.Add_Tick({
+            $line = $null
+            $sb = New-Object System.Text.StringBuilder
+            while ($Sync.Log.TryDequeue([ref]$line)) { [void]$sb.AppendLine($line) }
+            if ($sb.Length) { $script:ui.PageLog.AppendText($sb.ToString()); $script:ui.PageLog.ScrollToEnd() }
+            if ($script:job) {
+                $script:ui.Progress.Value = $Sync.Progress
+                if ($Sync.Status) { $script:ui.TxtStatus.Text = $Sync.Status }
+                if ($Sync.Done) {
+                    try { $script:job.PS.Dispose(); $script:job.RS.Dispose() } catch { }
+                    $script:job = $null
+                    $script:ui.BtnStart.IsEnabled = $true; $script:ui.BtnCancel.IsEnabled = $false
+                    if ($Sync.Error) {
+                        $script:ui.TxtStatus.Text = "Fehler: $($Sync.Error)"
+                        Write-Log $Sync.Error 'ERROR'
+                    }
+                    else {
+                        $script:Result = $Sync.Result
+                        Show-Result
+                        $script:ui.NavDashboard.IsChecked = $true
+                    }
+                }
+            }
+        })
+    $timer.Start()
+    $win.Add_Closed({ $timer.Stop(); $Sync.Cancel = $true })
+    Write-Log 'GUI gestartet (read-only)'
+    [void]$win.ShowDialog()
+}
+
+#endregion
+
+#region ===================== Start =====================
+
+if ($NoGui) {
+    $u = @($Users); $g = @($Groups)
+    if ($InputCsv) { $imp = Import-InputCsv -Path $InputCsv; $u += $imp.Users; $g += $imp.Groups }
+    if ($u.Count + $g.Count -eq 0) { throw 'Bitte -Users, -Groups oder -InputCsv angeben.' }
+    [void](New-Item -ItemType Directory -Path $OutDir -Force)
+    $Sync.LogFile = Join-Path $OutDir ('ADAssessment_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
+    $result = Invoke-ADAssessment -Users $u -Groups $g -Server $Server -CustomPrivilegedOUs $CustomPrivilegedOUs -IncludeContainers:$IncludeContainers -MaxDepth $MaxDepth
+    $files = Export-AssessmentResult -Result $result -Directory $OutDir -Pdf:$Pdf
+    $result.Stats | Format-List
+    Write-Host "Berichte:`n$($files -join "`n")"
+}
+else {
+    Show-AssessmentGui
+}
+
+#endregion
